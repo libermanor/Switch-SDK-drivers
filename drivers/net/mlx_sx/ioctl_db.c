@@ -37,6 +37,7 @@
 
 #include "alloc.h"
 #include "sx_dpt.h"
+#include "cq.h"
 #include "ioctl_internal.h"
 
 /**
@@ -46,7 +47,7 @@
  * struct is successfully copied between user space and kernel space.
  */
 #define SX_CORE_DB_MAGIC_NUM 0xabcdabcd
-
+extern u8 __warm_boot_mode;
 static int sx_core_ioctl_set_dpt_info(struct sx_dev *dev, struct ku_sx_core_db *sx_core_db)
 {
     int                    err = 0;
@@ -150,19 +151,19 @@ static int sx_core_ioctl_set_netdev_trap_info(struct sx_dev *dev, struct ku_sx_c
             case USER_CHANNEL_L3_NETDEV:
                 err =
                     sx_core_add_synd_l3(0, sx_core_db->trap_ids[uc_type][i], dev,
-                                        &(sx_core_db->port_vlan_params[uc_type][i]));
+                                        &(sx_core_db->port_vlan_params[uc_type][i]), 1);
                 break;
 
             case USER_CHANNEL_LOG_PORT_NETDEV:
                 err =
                     sx_core_add_synd_l2(0, sx_core_db->trap_ids[uc_type][i], dev,
-                                        &(sx_core_db->port_vlan_params[uc_type][i]));
+                                        &(sx_core_db->port_vlan_params[uc_type][i]), 1);
                 break;
 
             case USER_CHANNEL_PHY_PORT_NETDEV:
                 err =
                     sx_core_add_synd_phy(0, sx_core_db->trap_ids[uc_type][i], dev,
-                                         &(sx_core_db->port_vlan_params[uc_type][i]));
+                                         &(sx_core_db->port_vlan_params[uc_type][i]), 1);
                 break;
             }
 
@@ -186,6 +187,14 @@ static int sx_core_ioctl_set_rdq_properties(struct sx_dev *dev, struct ku_sx_cor
             sx_bitmap_set(&sx_priv(dev)->cq_table.ts_bitmap, i);
         } else {
             sx_bitmap_free(&sx_priv(dev)->cq_table.ts_bitmap, i);
+        }
+    }
+
+    for (i = 0; i < sx_core_db->ts_hw_utc_bitmap.max; i++) {
+        if (sx_core_db->ts_hw_utc_bitmap.table[i]) {
+            sx_bitmap_set(&sx_priv(dev)->cq_table.ts_hw_utc_bitmap, i);
+        } else {
+            sx_bitmap_free(&sx_priv(dev)->cq_table.ts_hw_utc_bitmap, i);
         }
     }
 
@@ -382,7 +391,7 @@ static int sx_core_ioctl_get_rdq_properties(struct sx_dev *dev, struct ku_sx_cor
         goto out;
     }
     for (i = 0; i < sx_priv(dev)->cq_table.ts_bitmap.max; i++) {
-        if (sx_bitmap_test(&(sx_priv(dev)->cq_table.ts_bitmap), i)) {
+        if (IS_CQ_WORKING_WITH_TIMESTAMP(dev, i)) {
             err = put_user((uint8_t)1, &(sx_core_db->ts_bitmap.table[i]));
         } else {
             err = put_user((uint8_t)0, &(sx_core_db->ts_bitmap.table[i]));
@@ -1156,13 +1165,31 @@ out:
     return err;
 }
 
+static void ber_monitor_bitmask_work_handler(struct work_struct *work)
+{
+    struct ber_bitmask_set_work_data *ber_wdata = container_of(work, struct ber_bitmask_set_work_data, work);
+    unsigned long                     flags;
+
+    spin_lock_irqsave(&sx_priv(ber_wdata->dev)->db_lock, flags);
+    sx_priv(ber_wdata->dev)->port_ber_monitor_bitmask[ber_wdata->local_port] = ber_wdata->bitmask;
+    /* If BER monitor is disable: clear the operational state */
+    if (ber_wdata->bitmask == 0) {
+        sx_priv(ber_wdata->dev)->port_ber_monitor_state[ber_wdata->local_port] = 0;
+    }
+    spin_unlock_irqrestore(&sx_priv(ber_wdata->dev)->db_lock, flags);
+
+    complete(ber_wdata->wq_completion);
+}
 
 long ctrl_cmd_port_ber_monitor_bitmask_set(struct file *file, unsigned int cmd, unsigned long data)
 {
     struct ku_ber_monitor_bitmask_data ber_monitor_bitmask_data;
     struct sx_dev                     *dev;
-    unsigned long                      flags;
     int                                err;
+    struct completion                  __ber_wq_completion;
+    struct ber_bitmask_set_work_data   ber_wdata;
+
+    memset(&ber_wdata, 0, sizeof(ber_wdata));
 
     SX_CORE_IOCTL_GET_GLOBAL_DEV(&dev);
 
@@ -1179,13 +1206,18 @@ long ctrl_cmd_port_ber_monitor_bitmask_set(struct file *file, unsigned int cmd, 
         goto out;
     }
 
-    spin_lock_irqsave(&sx_priv(dev)->db_lock, flags);
-    sx_priv(dev)->port_ber_monitor_bitmask[ber_monitor_bitmask_data.local_port] = ber_monitor_bitmask_data.bitmask;
-    /* If BER monitor is disable: clear the operational state */
-    if (ber_monitor_bitmask_data.bitmask == 0) {
-        sx_priv(dev)->port_ber_monitor_state[ber_monitor_bitmask_data.local_port] = 0;
-    }
-    spin_unlock_irqrestore(&sx_priv(dev)->db_lock, flags);
+    /* The ber monitor DB update is done in worker thread to prevent
+     * race between DB update and PPBME handler */
+    init_completion(&__ber_wq_completion);
+    ber_wdata.dev = dev;
+    ber_wdata.local_port = ber_monitor_bitmask_data.local_port;
+    ber_wdata.bitmask = ber_monitor_bitmask_data.bitmask;
+    ber_wdata.wq_completion = &__ber_wq_completion;
+    INIT_WORK(&ber_wdata.work, ber_monitor_bitmask_work_handler);
+    queue_work(dev->generic_wq, &ber_wdata.work);
+
+    /* Wait for DB update completion for synchronous ioctl */
+    wait_for_completion_interruptible(&__ber_wq_completion);
 
 out:
     return err;
@@ -1198,8 +1230,6 @@ long ctrl_cmd_tele_threshold_set(struct file *file, unsigned int cmd, unsigned l
     struct sx_dev                *dev;
     unsigned long                 flags;
     int                           err;
-
-    printk(KERN_DEBUG PFX "ioctl CTRL_CMD_TELE_THRESHOLD_SET called\n");
 
     SX_CORE_IOCTL_GET_GLOBAL_DEV(&dev);
 
@@ -1216,13 +1246,20 @@ long ctrl_cmd_tele_threshold_set(struct file *file, unsigned int cmd, unsigned l
         goto out;
     }
 
+    if (tele_thrs_data.dir_ing > TELE_DIR_ING_MAX_E) {
+        printk(KERN_ERR PFX "Received dir_ing %d is invalid (max. %d) \n",
+               tele_thrs_data.dir_ing, TELE_DIR_ING_MAX_E);
+        err = -EINVAL;
+        goto out;
+    }
+
     spin_lock_irqsave(&sx_priv(dev)->db_lock, flags);
     if (tele_thrs_data.tc_vec == 0) {
-        sx_priv(dev)->tele_thrs_state[tele_thrs_data.local_port] = 0;
+        sx_priv(dev)->tele_thrs_state[tele_thrs_data.local_port][tele_thrs_data.dir_ing] = 0;
         /* We clear tc vector DB only if all TCs were removed */
-        sx_priv(dev)->tele_thrs_tc_vec[tele_thrs_data.local_port] = 0;
+        sx_priv(dev)->tele_thrs_tc_vec[tele_thrs_data.local_port][tele_thrs_data.dir_ing] = 0;
     } else {
-        SX_TELE_THRS_VALID_SET(sx_priv(dev)->tele_thrs_state[tele_thrs_data.local_port]);
+        SX_TELE_THRS_VALID_SET(sx_priv(dev)->tele_thrs_state[tele_thrs_data.local_port][tele_thrs_data.dir_ing]);
     }
     spin_unlock_irqrestore(&sx_priv(dev)->db_lock, flags);
 
@@ -1372,6 +1409,71 @@ long ctrl_cmd_set_default_vid(struct file *file, unsigned int cmd, unsigned long
     }
 
     spin_unlock_irqrestore(&sx_priv(dev)->db_lock, flags);
+
+out:
+    return err;
+}
+
+long ctrl_cmd_set_warm_boot_mode(struct file *file, unsigned int cmd, unsigned long data)
+{
+    uint32_t       warm_boot_mode;
+    struct sx_dev *dev;
+    unsigned long  flags;
+    int            err;
+
+    SX_CORE_IOCTL_GET_GLOBAL_DEV(&dev);
+
+    err = copy_from_user(&warm_boot_mode, (void*)data, sizeof(warm_boot_mode));
+    if (err) {
+        goto out;
+    }
+
+    /* in case of warm boot generate udev_add event */
+    if (warm_boot_mode) {
+        /* udev event for system management purpose */
+        kobject_uevent(&dev->pdev->dev.kobj, KOBJ_ADD);
+        __warm_boot_mode = 1;
+
+        /* sx_priv(dev)->warm_boot_mode is for debug purpose only
+         * the logic based on __warm_boot_mode variable */
+        spin_lock_irqsave(&sx_priv(dev)->db_lock, flags);
+        sx_priv(dev)->warm_boot_mode = warm_boot_mode;
+        spin_unlock_irqrestore(&sx_priv(dev)->db_lock, flags);
+    }
+
+out:
+    return err;
+}
+
+long ctrl_cmd_psample_port_sample_rate_update(struct file *file, unsigned int cmd, unsigned long data)
+{
+    struct ku_psample_port_sample_rate sample_rate;
+    union sx_event_data               *event_data;
+    struct sx_dev                     *dev;
+    int                                err;
+
+#if !IS_ENABLED(CONFIG_PSAMPLE)
+    return 0;
+#endif /* !IS_ENABLED(CONFIG_PSAMPLE) */
+       /* coverity[unreachable] */
+
+    err = copy_from_user(&sample_rate, (void*)data, sizeof(sample_rate));
+    if (err) {
+        goto out;
+    }
+
+    SX_CORE_IOCTL_GET_GLOBAL_DEV(&dev);
+
+    event_data = kzalloc(sizeof(union sx_event_data), GFP_KERNEL);
+    if (!event_data) {
+        err = -ENOMEM;
+        goto out;
+    }
+
+    event_data->psample_port_sample_rate.local_port = sample_rate.local_port;
+    event_data->psample_port_sample_rate.sample_rate = sample_rate.rate;
+    sx_core_dispatch_event(dev, SX_DEV_EVENT_UPDATE_SAMPLE_RATE, event_data);
+    kfree(event_data);
 
 out:
     return err;
